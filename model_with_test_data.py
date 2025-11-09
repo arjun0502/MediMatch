@@ -314,7 +314,7 @@ def generate_offers(order_history, inventory, needslist=None, current_date='2025
             all_offers.append({
                 'clinic': clinic,
                 'sku_id': sku_id,
-                'item': item,
+                'item_name': item,
                 'probability': pred['probability'],
                 'suggested_quantity': min(int(pred['suggested_quantity']), available_qty),
                 'available_in_stock': available_qty,
@@ -325,6 +325,7 @@ def generate_offers(order_history, inventory, needslist=None, current_date='2025
                 'delivery_season': pred['delivery_season'],
                 'on_needslist': on_needslist,
                 'reason': pred['reason'],
+                'name': clinic  # Add clinic name explicitly
             })
 
     offers_df = pd.DataFrame(all_offers)
