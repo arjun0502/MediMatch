@@ -1,4 +1,67 @@
-# recommend_offers.py
+"""
+MediMatch offer generation model
+
+This module contains the unified probability model and offer generation
+pipeline used to predict which clinic×item combinations should be offered
+from inventory. It's provided with lightweight test-data helpers and a
+CLI entrypoint for running against CSV files.
+
+High-level flow (input -> output):
+
+- Inputs:
+    - order_history.csv: historical orders with columns:
+            OUTBOUND RECIPIENT, ITEMIZED LIST, DATE REDISTRIBUTED, UNITS DISTRIBUTED
+    - inventory.csv: current inventory with columns:
+            GENERIC NAME, SKU ID, EXPIRATION_DATE, CASE QTY
+    - needslist.csv (optional): explicit clinic requests with columns:
+            Clinic Name, Exact Item Name (Inventory), NEEDS_ITEM
+
+- Process:
+    1. Load CSVs
+    2. For each clinic×item present in history and inventory, run
+         `calculate_probability(...)` which:
+             - computes reorder intervals from history
+             - classifies timing (too soon / approaching / overdue)
+             - applies consistency and seasonal adjustments
+             - boosts items on the needslist
+             - returns a probability and suggested quantity
+    3. Filter out items expiring soon and those below the predicted
+         probability threshold (unless they're on the needslist)
+    4. Emit `offers_out.csv` containing offers sorted by clinic and
+         probability
+
+- Output: `offers_out.csv` with columns including:
+    clinic, sku_id, item, probability, suggested_quantity, available_in_stock,
+    expiration_date, days_since_last_order, avg_reorder_interval,
+    seasonal_factor, delivery_season, on_needslist, reason
+
+Design notes
+- The probability calculation blends timing (intervals), seasonality
+        (clinic×item seasonal multipliers), and explicit needslist boosts. The
+        model is intentionally transparent and clamped to sensible floors/caps
+        so downstream users can understand and tune behavior.
+
+Variants
+- This repository contains two variants of the pipeline:
+    - CSV-backed (`model_with_test_data.py`) — reads/writes CSV files and is
+        intended for local testing and batch runs.
+    - Supabase-backed (`model_with_supabase.py`) — reads inputs from and
+        writes outputs to a Supabase instance for production automation. The
+        Supabase module contains helpers to translate database rows into the
+        same pandas-compatible structures used here.
+
+Usage (from repository root, PowerShell):
+
+    # create a venv (not checked into git)
+    python -m venv .venv;
+    .\.venv\Scripts\Activate.ps1;
+    pip install -r requirements.txt  # create file if you need one: pandas,numpy
+
+    # run with test CSVs (defaults in CLI)
+    python model_with_test_data.py --order_history ./test_data/order_history.csv --inventory ./test_data/inventory.csv --needslist ./test_data/needslist.csv
+
+"""
+
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
@@ -53,13 +116,28 @@ def is_expiring_soon(expiration_date, current_date, days_threshold=30):
         return False
 
 # ----------------------------
-# Probability models
+# Unified Probability Model
 # ----------------------------
 def _safe_mean(series, default=50):
     s = pd.to_numeric(series, errors='coerce').dropna()
     return int(round(s.mean())) if len(s) else default
 
-def calculate_needslist_probability(order_history, clinic, item, current_date, delivery_days=3):
+def calculate_probability(order_history, clinic, item, current_date, delivery_days=3, on_needslist=False):
+    """
+    UNIFIED probability calculation with needslist boost.
+    
+    PHILOSOPHY:
+    - Calculate base probability (0.05-0.75) using timing + seasonality for ALL items
+    - If on needslist, add +0.25 bonus to prioritize explicit requests
+    - This ensures needslist items (0.30-1.00) always rank above predicted (0.05-0.75)
+    
+    CALCULATION STEPS:
+    1. Analyze historical ordering patterns (intervals between orders)
+    2. Assess current timing (are they due for reorder?)
+    3. Apply seasonal adjustment (do they order more in this season?)
+    4. Add needslist bonus if applicable
+    5. Apply final caps/floors
+    """
     orders = order_history[
         (order_history['OUTBOUND RECIPIENT'] == clinic) &
         (order_history['ITEMIZED LIST'] == item)
@@ -68,86 +146,21 @@ def calculate_needslist_probability(order_history, clinic, item, current_date, d
     orders['DATE REDISTRIBUTED'] = pd.to_datetime(orders['DATE REDISTRIBUTED'])
     orders = orders.sort_values('DATE REDISTRIBUTED')
 
+    # INSUFFICIENT DATA CASE: Use conservative defaults
     if len(orders) < 3:
+        base_prob = 0.50 if on_needslist else 0.20
         return {
-            'probability': 0.75,
-            'reason': 'On needslist (limited order history)',
+            'probability': base_prob,
+            'reason': f"{'On needslist - ' if on_needslist else ''}Limited order history (<3 orders)",
             'suggested_quantity': _safe_mean(orders['UNITS DISTRIBUTED']),
             'days_since_last': None,
             'avg_interval': None,
             'seasonal_factor': 1.0,
-            'delivery_season': get_season(pd.to_datetime(current_date) + timedelta(days=delivery_days))
+            'delivery_season': get_season(pd.to_datetime(current_date) + timedelta(days=delivery_days)),
+            'on_needslist': on_needslist
         }
 
-    intervals = orders['DATE REDISTRIBUTED'].diff().dt.days.dropna()
-    avg_interval = intervals.mean()
-
-    last_order = orders['DATE REDISTRIBUTED'].max()
-    current_dt = pd.to_datetime(current_date)
-    days_since_last = (current_dt - last_order).days
-
-    delivery_date = current_dt + timedelta(days=delivery_days)
-    delivery_adjusted_days = days_since_last + delivery_days
-
-    seasonal_multipliers = calculate_seasonal_preference(order_history, clinic, item)
-    delivery_season = get_season(delivery_date)
-    seasonal_factor = seasonal_multipliers[delivery_season]
-
-    # Lenient window for needslist items
-    if delivery_adjusted_days >= 0.8 * avg_interval:
-        base = 0.85
-        reason = f"On needslist, due for reorder (avg {avg_interval:.0f}d, {days_since_last}d since last)"
-    else:
-        progress = delivery_adjusted_days / max(0.8 * avg_interval, 1e-9)
-        base = 0.65 + 0.20 * min(progress, 1.0)
-        reason = f"On needslist ({days_since_last}d since last, avg {avg_interval:.0f}d)"
-
-    adjusted = base * seasonal_factor
-    if seasonal_factor > 1.2:
-        reason += f" (HIGH demand in {delivery_season})"
-        adjusted = min(adjusted, 0.95)
-    elif seasonal_factor < 0.8:
-        reason += f" (LOW demand in {delivery_season})"
-        adjusted = max(adjusted, 0.60)
-    else:
-        adjusted = float(np.clip(adjusted, 0.60, 0.95))
-
-    seasonal_orders = orders[orders['DATE REDISTRIBUTED'].apply(get_season) == delivery_season]
-    if len(seasonal_orders) >= 2:
-        suggested_qty = _safe_mean(seasonal_orders['UNITS DISTRIBUTED'])
-    else:
-        suggested_qty = _safe_mean(orders['UNITS DISTRIBUTED'])
-
-    return {
-        'probability': adjusted,
-        'reason': reason,
-        'suggested_quantity': suggested_qty,
-        'days_since_last': days_since_last,
-        'avg_interval': avg_interval,
-        'seasonal_factor': seasonal_factor,
-        'delivery_season': delivery_season
-    }
-
-def calculate_predicted_probability(order_history, clinic, item, current_date, delivery_days=3):
-    orders = order_history[
-        (order_history['OUTBOUND RECIPIENT'] == clinic) &
-        (order_history['ITEMIZED LIST'] == item)
-    ].copy()
-
-    orders['DATE REDISTRIBUTED'] = pd.to_datetime(orders['DATE REDISTRIBUTED'])
-    orders = orders.sort_values('DATE REDISTRIBUTED')
-
-    if len(orders) < 3:
-        return {
-            'probability': 0.20,
-            'reason': 'Insufficient order history (<3 orders)',
-            'suggested_quantity': _safe_mean(orders['UNITS DISTRIBUTED']),
-            'days_since_last': None,
-            'avg_interval': None,
-            'seasonal_factor': 1.0,
-            'delivery_season': get_season(pd.to_datetime(current_date) + timedelta(days=delivery_days))
-        }
-
+    # HISTORICAL PATTERN ANALYSIS
     intervals = orders['DATE REDISTRIBUTED'].diff().dt.days.dropna()
     avg_interval = intervals.mean()
     min_interval = intervals.min()
@@ -160,40 +173,56 @@ def calculate_predicted_probability(order_history, clinic, item, current_date, d
     delivery_date = current_dt + timedelta(days=delivery_days)
     delivery_adjusted_days = days_since_last + delivery_days
 
+    # TIMING ASSESSMENT: Calculate base probability from reorder patterns
+    # Three scenarios based on where they are in their ordering cycle
+    
+    if delivery_adjusted_days < 0.8 * min_interval:
+        # TOO SOON: Haven't even reached 80% of their shortest interval
+        base = 0.10
+        reason = f"Too soon (last {days_since_last}d, min interval {min_interval:.0f}d)"
+        
+    elif delivery_adjusted_days >= avg_interval:
+        # OVERDUE: Past their average reorder time - likely need it
+        overdue_factor = (delivery_adjusted_days - avg_interval) / max(avg_interval, 1e-9)
+        base = 0.50 + 0.25 * min(overdue_factor, 1.0)  # 0.50 to 0.75
+        reason = f"Due for reorder (avg {avg_interval:.0f}d, {days_since_last}d since last)"
+        
+    else:
+        # APPROACHING: In the window between min and avg interval
+        denom = max(avg_interval - min_interval, 1e-9)
+        progress = (delivery_adjusted_days - min_interval) / denom
+        base = 0.25 + 0.25 * np.clip(progress, 0.0, 1.0)  # 0.25 to 0.50
+        reason = f"Approaching reorder window ({days_since_last}d since last, avg {avg_interval:.0f}d)"
+
+    # CONSISTENCY BONUS: Reward predictable ordering patterns
+    if avg_interval > 0 and (std_interval / avg_interval) < 0.3:
+        base = min(base * 1.1, 0.65 if not on_needslist else 0.75)  # +10% bonus, different caps
+        reason += " (consistent pattern)"
+
+    # SEASONAL ADJUSTMENT: Modify based on historical seasonal demand
     seasonal_multipliers = calculate_seasonal_preference(order_history, clinic, item)
     delivery_season = get_season(delivery_date)
     seasonal_factor = seasonal_multipliers[delivery_season]
 
-    # Strict timing logic (personalized to this clinic×item)
-    if delivery_adjusted_days < 0.8 * min_interval:
-        base = 0.10
-        reason = f"Too soon (last {days_since_last}d, min interval {min_interval:.0f}d)"
-    elif delivery_adjusted_days >= avg_interval:
-        overdue_factor = (delivery_adjusted_days - avg_interval) / max(avg_interval, 1e-9)
-        base = 0.60 + 0.30 * min(overdue_factor, 1.0)  # up to 0.90
-        reason = f"Due for reorder (avg {avg_interval:.0f}d, {days_since_last}d since last)"
-    else:
-        denom = max(avg_interval - min_interval, 1e-9)
-        progress = (delivery_adjusted_days - min_interval) / denom
-        base = 0.25 + 0.35 * np.clip(progress, 0.0, 1.0)
-        reason = f"Approaching reorder window ({days_since_last}d since last, avg {avg_interval:.0f}d)"
-
-    # Consistency bonus
-    if avg_interval > 0 and (std_interval / avg_interval) < 0.3:
-        base = min(base * 1.1, 0.95)
-        reason += " (consistent pattern)"
-
-    # Seasonality
     adjusted = base * seasonal_factor
+    
+    # Apply seasonal caps/floors
     if seasonal_factor > 1.2:
         reason += f" (HIGH demand in {delivery_season})"
-        adjusted = min(adjusted, 0.95)
+        adjusted = min(adjusted, 0.65 if not on_needslist else 0.75)  # Cap predicted lower
     elif seasonal_factor < 0.8:
         reason += f" (LOW demand in {delivery_season})"
         adjusted = max(adjusted, 0.05)
     else:
-        adjusted = float(np.clip(adjusted, 0.05, 0.95))
+        adjusted = float(np.clip(adjusted, 0.05, 0.65 if not on_needslist else 0.75))
 
+    # NEEDSLIST BOOST: Add transparent bonus for explicit requests
+    if on_needslist:
+        adjusted = min(adjusted + 0.25, 1.0)  # +25 point boost, cap at 100%
+        adjusted = max(adjusted, 0.70)  # Floor at 70% for needslist items
+        reason = f"On needslist (+25% boost) - {reason}"
+
+    # QUANTITY SUGGESTION: Use seasonal data if available
     seasonal_orders = orders[orders['DATE REDISTRIBUTED'].apply(get_season) == delivery_season]
     if len(seasonal_orders) >= 2:
         suggested_qty = _safe_mean(seasonal_orders['UNITS DISTRIBUTED'])
@@ -207,7 +236,8 @@ def calculate_predicted_probability(order_history, clinic, item, current_date, d
         'days_since_last': days_since_last,
         'avg_interval': avg_interval,
         'seasonal_factor': seasonal_factor,
-        'delivery_season': delivery_season
+        'delivery_season': delivery_season,
+        'on_needslist': on_needslist
     }
 
 # ----------------------------
@@ -216,9 +246,16 @@ def calculate_predicted_probability(order_history, clinic, item, current_date, d
 def generate_offers(order_history, inventory, needslist=None, current_date='2025-11-08',
                    delivery_days=3, min_probability_predicted=0.40, expiration_threshold_days=30):
     """
-    Strategy:
-      1) NEEDSLIST items: always include (rank by probability)
-      2) PREDICTED items: include only if probability >= threshold
+    Generate ranked offer list for all clinics.
+    
+    STRATEGY:
+    1. For each clinic×item with order history
+    2. Calculate probability using unified method
+    3. Add needslist boost if applicable
+    4. Include in offers if:
+       - On needslist (always include, regardless of probability)
+       - NOT on needslist AND probability >= threshold (default 40%)
+    5. Sort by probability (needslist items naturally rank highest)
     """
 
     order_history = order_history.copy()
@@ -234,7 +271,7 @@ def generate_offers(order_history, inventory, needslist=None, current_date='2025
 
     inventory_items = set(inv['ITEM'].values)
 
-    needslist_offers, predicted_offers = [], []
+    all_offers = []
 
     # All clinic×item pairs that exist in history AND are in inventory
     pairs = (order_history.groupby(['OUTBOUND RECIPIENT', 'ITEMIZED LIST'])
@@ -250,13 +287,13 @@ def generate_offers(order_history, inventory, needslist=None, current_date='2025
         expiration = item_inventory.get('EXPIRATION_DATE', 'N/A')
         sku_id = item_inventory.get('SKU ID', None)
 
+        # Skip items expiring soon
         if is_expiring_soon(expiration, current_date, expiration_threshold_days):
             continue
 
-        # Is it on needslist?
+        # Check if on needslist
         on_needslist = False
         if needslist is not None and len(needslist) > 0:
-            # Treat missing NEEDS_ITEM as True
             needs_flag = needslist['NEEDS_ITEM'] if 'NEEDS_ITEM' in needslist.columns else True
             needs_mask = (
                 (needslist['Clinic Name'] == clinic) &
@@ -265,9 +302,16 @@ def generate_offers(order_history, inventory, needslist=None, current_date='2025
             )
             on_needslist = bool(needs_mask.any())
 
-        if on_needslist:
-            pred = calculate_needslist_probability(order_history, clinic, item, current_date, delivery_days)
-            needslist_offers.append({
+        # Calculate probability using unified method
+        pred = calculate_probability(
+            order_history, clinic, item, current_date, delivery_days, on_needslist
+        )
+
+        # Decision: Include this offer?
+        include_offer = on_needslist or (pred['probability'] >= min_probability_predicted)
+
+        if include_offer:
+            all_offers.append({
                 'clinic': clinic,
                 'sku_id': sku_id,
                 'item': item,
@@ -279,35 +323,20 @@ def generate_offers(order_history, inventory, needslist=None, current_date='2025
                 'avg_reorder_interval': pred['avg_interval'],
                 'seasonal_factor': pred['seasonal_factor'],
                 'delivery_season': pred['delivery_season'],
-                'on_needslist': True,
+                'on_needslist': on_needslist,
                 'reason': pred['reason'],
             })
-        else:
-            pred = calculate_predicted_probability(order_history, clinic, item, current_date, delivery_days)
-            if pred['probability'] >= min_probability_predicted:
-                predicted_offers.append({
-                    'clinic': clinic,
-                    'sku_id': sku_id,
-                    'item': item,
-                    'probability': pred['probability'],
-                    'suggested_quantity': min(int(pred['suggested_quantity']), available_qty),
-                    'available_in_stock': available_qty,
-                    'expiration_date': expiration,
-                    'days_since_last_order': pred['days_since_last'],
-                    'avg_reorder_interval': pred['avg_interval'],
-                    'seasonal_factor': pred['seasonal_factor'],
-                    'delivery_season': pred['delivery_season'],
-                    'on_needslist': False,
-                    'reason': pred['reason'],
-                })
 
-    needslist_df = pd.DataFrame(needslist_offers).sort_values('probability', ascending=False) if needslist_offers else pd.DataFrame()
-    predicted_df = pd.DataFrame(predicted_offers).sort_values('probability', ascending=False) if predicted_offers else pd.DataFrame()
-    offers_df = pd.concat([needslist_df, predicted_df], ignore_index=True).sort_values(['clinic', 'probability'], ascending=[True, False])
+    offers_df = pd.DataFrame(all_offers)
+    if not offers_df.empty:
+        # Sort by clinic, then probability (needslist items naturally rank highest)
+        offers_df = offers_df.sort_values(['clinic', 'probability'], ascending=[True, False])
+    
     return offers_df
 
 def generate_offers_for_clinic(order_history, inventory, clinic_name, needslist=None,
                                current_date='2025-11-08', delivery_days=3, expiration_threshold_days=30):
+    """Generate offers for a specific clinic."""
     all_offers = generate_offers(
         order_history, inventory, needslist, current_date, delivery_days,
         min_probability_predicted=0.0, expiration_threshold_days=expiration_threshold_days
@@ -318,10 +347,10 @@ def generate_offers_for_clinic(order_history, inventory, clinic_name, needslist=
 # CLI / Main
 # ----------------------------
 def main():
-    parser = argparse.ArgumentParser(description="Generate clinic-item offers.")
-    parser.add_argument("--order_history", default="./data/order_history.csv", help="Path to order_history.csv")
-    parser.add_argument("--inventory", default="./data/inventory.csv", help="Path to inventory.csv (GENERIC NAME, SKU ID, EXPIRATION_DATE, CASE QTY)")
-    parser.add_argument("--needslist", default="./data/needslist.csv", help="Optional path to needslist.csv (Clinic Name, Exact Item Name (Inventory), NEEDS_ITEM)")
+    parser = argparse.ArgumentParser(description="Generate clinic-item offers using unified probability model.")
+    parser.add_argument("--order_history", default="./test_data/order_history.csv", help="Path to order_history.csv")
+    parser.add_argument("--inventory", default="./test_data/inventory.csv", help="Path to inventory.csv (GENERIC NAME, SKU ID, EXPIRATION_DATE, CASE QTY)")
+    parser.add_argument("--needslist", default="./test_data/needslist.csv", help="Optional path to needslist.csv (Clinic Name, Exact Item Name (Inventory), NEEDS_ITEM)")
     parser.add_argument("--current_date", default=datetime.today().strftime("%Y-%m-%d"))
     parser.add_argument("--delivery_days", type=int, default=3)
     parser.add_argument("--predicted_threshold", type=float, default=0.40)
